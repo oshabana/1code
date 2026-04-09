@@ -34,26 +34,58 @@ type OpencodeSessionInfo = {
 }
 
 type OpencodeClientLike = {
+  provider: {
+    list: (
+      body?: { directory?: string } | Record<string, unknown>,
+      options?: { throwOnError?: boolean },
+    ) => Promise<{
+      data:
+        | {
+            all: Array<{
+              id: string
+              name: string
+              models: Record<
+                string,
+                {
+                  id: string
+                  name: string
+                  status?: "alpha" | "beta" | "deprecated"
+                  experimental?: boolean
+                }
+              >
+            }>
+            connected: string[]
+            default: Record<string, string>
+          }
+        | undefined
+    }>
+    auth: (
+      body?: { directory?: string } | Record<string, unknown>,
+      options?: { throwOnError?: boolean },
+    ) => Promise<{ data: Record<string, Array<{ type: "oauth" | "api"; label: string }>> | undefined }>
+  }
   session: {
     create: (
       body: { directory?: string } | Record<string, unknown>,
       options?: { throwOnError?: boolean },
     ) => Promise<{ data: OpencodeSessionInfo | undefined }>
     get: (
-      body: { sessionID: string; directory?: string },
+      body: { path: { id: string }; query?: { directory?: string } },
       options?: { throwOnError?: boolean },
     ) => Promise<{ data: OpencodeSessionInfo | undefined }>
     prompt: (
       body: {
-        sessionID: string
-        directory?: string
-        parts: Array<{ type: "text"; text: string }>
-        model?: { providerID: string; modelID: string }
+        path: { id: string }
+        query?: { directory?: string }
+        body: {
+          parts: Array<{ type: "text"; text: string }>
+          model?: { providerID: string; modelID: string }
+        }
       },
       options?: { throwOnError?: boolean },
     ) => Promise<{ data: unknown }>
     abort: (
-      body: { sessionID: string; directory?: string },
+      body: { path: { id: string }; query?: { directory?: string } },
       options?: { throwOnError?: boolean },
     ) => Promise<{ data: unknown }>
   }
@@ -63,10 +95,44 @@ type CachedServer = {
   handle: OpencodeServerHandle
   client: OpencodeClientLike
   startedAt: number
+  external: boolean
 }
 
 let cachedServer: CachedServer | null = null
 let startingServerPromise: Promise<CachedServer> | null = null
+
+const DEFAULT_OPENCODE_SERVER_URL = "http://127.0.0.1:4096"
+
+async function probeExistingOpencodeServer(
+  createOpencodeClient: (cfg: {
+    baseUrl: string
+    directory?: string
+  }) => OpencodeClientLike,
+): Promise<CachedServer | null> {
+  try {
+    const client = createOpencodeClient({ baseUrl: DEFAULT_OPENCODE_SERVER_URL })
+    const result = await client.provider.list({ throwOnError: true })
+    if (!result.data) return null
+
+    console.log(
+      `[opencode] reusing existing server at ${DEFAULT_OPENCODE_SERVER_URL}`,
+    )
+
+    return {
+      handle: {
+        url: DEFAULT_OPENCODE_SERVER_URL,
+        close() {
+          // External user-managed server; do not stop it from the app.
+        },
+      },
+      client,
+      startedAt: Date.now(),
+      external: true,
+    }
+  } catch {
+    return null
+  }
+}
 
 /**
  * Lazy-load the opencode SDK's server + client factories. Returns the
@@ -104,6 +170,12 @@ export async function ensureOpencodeServer(): Promise<CachedServer> {
   startingServerPromise = (async () => {
     const { createOpencodeServer, createOpencodeClient } = await loadSdk()
 
+    const existing = await probeExistingOpencodeServer(createOpencodeClient)
+    if (existing) {
+      cachedServer = existing
+      return existing
+    }
+
     // Surface a cleaner error than the SDK's "Timeout waiting for server"
     // when the user hasn't installed opencode on PATH.
     try {
@@ -132,6 +204,7 @@ export async function ensureOpencodeServer(): Promise<CachedServer> {
         handle,
         client,
         startedAt: Date.now(),
+        external: false,
       }
       cachedServer = entry
       console.log(
@@ -162,9 +235,23 @@ export function getOpencodeServerUrl(): string | null {
 export function shutdownOpencodeServer(): void {
   if (!cachedServer) return
   try {
-    cachedServer.handle.close()
+    if (!cachedServer.external) {
+      cachedServer.handle.close()
+    }
   } catch (error) {
     console.error("[opencode] failed to close server:", error)
   }
   cachedServer = null
+}
+
+/**
+ * Force a fresh opencode server on the next access.
+ *
+ * This is primarily used by the renderer's "Refresh" action so config
+ * changes made outside the app can be picked up without requiring a full
+ * app restart.
+ */
+export async function restartOpencodeServer(): Promise<CachedServer> {
+  shutdownOpencodeServer()
+  return ensureOpencodeServer()
 }

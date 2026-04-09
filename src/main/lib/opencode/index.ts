@@ -1,8 +1,9 @@
-export { createTransformer } from "./transform"
+export { createTransformer, replayAssistantSnapshot } from "./transform"
 export { buildOpencodeEnv } from "./env"
 export {
   ensureOpencodeServer,
   getOpencodeServerUrl,
+  restartOpencodeServer,
   shutdownOpencodeServer,
 } from "./server-manager"
 export { subscribeOpencodeEvents } from "./sse-client"

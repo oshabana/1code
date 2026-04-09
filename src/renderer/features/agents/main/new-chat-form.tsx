@@ -33,6 +33,7 @@ import {
   lastSelectedAgentIdAtom,
   lastSelectedCodexModelIdAtom,
   lastSelectedCodexThinkingAtom,
+  lastSelectedOpenCodeModelIdAtom,
   lastSelectedBranchesAtom,
   lastSelectedModelIdAtom,
   lastSelectedRepoAtom,
@@ -123,12 +124,29 @@ import {
   CODEX_MODELS,
   type CodexThinkingLevel,
 } from "../lib/models"
+import type { OpenCodeModelOption } from "../../../../shared/opencode-catalog"
+import { formatOpenCodeModelId } from "../../../../shared/opencode-catalog"
 // import type { PlanType } from "@/lib/config/subscription-plans"
 type PlanType = string
 
+type AvailableModels = {
+  models: typeof CLAUDE_MODELS
+  opencodeModels: OpenCodeModelOption[]
+  ollamaModels: string[]
+  recommendedModel?: string
+  isOffline: boolean
+  hasOllama: boolean
+}
+
+const SUBSCRIPTION_ONLY_CODEX_MODEL_IDS = new Set([
+  "gpt-5.3-codex",
+])
+
 // Hook to get available models (including offline models if Ollama is available and debug enabled)
-function useAvailableModels() {
+function useAvailableModels(): AvailableModels {
   const showOfflineFeatures = useAtomValue(showOfflineModeFeaturesAtom)
+  const hiddenModels = useAtomValue(hiddenModelsAtom)
+  const { data: opencodeCatalog } = trpc.opencode.getCatalog.useQuery()
   const { data: ollamaStatus } = trpc.ollama.getStatus.useQuery(undefined, {
     refetchInterval: showOfflineFeatures ? 30000 : false,
     enabled: showOfflineFeatures, // Only query Ollama when offline mode is enabled
@@ -148,6 +166,9 @@ function useAvailableModels() {
   if (showOfflineFeatures && hasOllama && isOffline) {
     return {
       models: baseModels,
+      opencodeModels: (opencodeCatalog?.models || []).filter(
+        (model) => !hiddenModels.includes(model.id),
+      ),
       ollamaModels,
       recommendedModel,
       isOffline,
@@ -157,6 +178,9 @@ function useAvailableModels() {
 
   return {
     models: baseModels,
+    opencodeModels: (opencodeCatalog?.models || []).filter(
+      (model) => !hiddenModels.includes(model.id),
+    ),
     ollamaModels: [] as string[],
     recommendedModel: undefined as string | undefined,
     isOffline,
@@ -169,6 +193,7 @@ const agents = [
   { id: "claude-code", name: "Claude Code", hasModels: true },
   { id: "cursor", name: "Cursor CLI", disabled: true },
   { id: "codex", name: "OpenAI Codex" },
+  { id: "opencode", name: "OpenCode" },
 ]
 
 interface NewChatFormProps {
@@ -327,22 +352,25 @@ export function NewChatForm({
   const [lastSelectedCodexThinking, setLastSelectedCodexThinking] = useAtom(
     lastSelectedCodexThinkingAtom,
   )
+  const [lastSelectedOpenCodeModelId, setLastSelectedOpenCodeModelId] = useAtom(
+    lastSelectedOpenCodeModelIdAtom,
+  )
   const [thinkingEnabled, setThinkingEnabled] = useAtom(
     extendedThinkingEnabledAtom,
   )
-
   const [selectedModel, setSelectedModel] = useState(
     () =>
-      availableModels.models.find((m) => m.id === lastSelectedModelId) || availableModels.models[0],
+      availableModels.models.find((m) => m.id === lastSelectedModelId) ||
+      availableModels.models[0],
   )
 
   // Sync selectedModel when atom value changes (e.g., after localStorage hydration)
   useEffect(() => {
     const model = availableModels.models.find((m) => m.id === lastSelectedModelId)
-    if (model && model.id !== selectedModel.id) {
+    if (model && model.id !== selectedModel?.id) {
       setSelectedModel(model)
     }
-  }, [lastSelectedModelId])
+  }, [lastSelectedModelId, availableModels.models, selectedModel?.id])
 
   const storedCodexApiKey = useAtomValue(codexApiKeyAtom)
   const hasAppCodexApiKey = Boolean(normalizeCodexApiKey(storedCodexApiKey))
@@ -350,7 +378,9 @@ export function NewChatForm({
   const codexUiModels = useMemo(
     () => {
       let models = hasAppCodexApiKey
-        ? CODEX_MODELS.filter((model) => model.id !== "gpt-5.3-codex")
+        ? CODEX_MODELS.filter(
+            (model) => !SUBSCRIPTION_ONLY_CODEX_MODEL_IDS.has(model.id),
+          )
         : CODEX_MODELS
       return models.filter((model) => !hiddenModels.includes(model.id))
     },
@@ -363,6 +393,34 @@ export function NewChatForm({
       CODEX_MODELS[0]!,
     [codexUiModels, lastSelectedCodexModelId],
   )
+
+  const selectedOpenCodeModel = useMemo(
+    () =>
+      availableModels.opencodeModels.find(
+        (model) => model.id === lastSelectedOpenCodeModelId,
+      ) ||
+      availableModels.opencodeModels.find(
+        (model) =>
+          formatOpenCodeModelId({
+            providerID: model.providerID,
+            modelID: model.id,
+          }) === lastSelectedOpenCodeModelId,
+      ) ||
+      availableModels.opencodeModels[0] ||
+      null,
+    [availableModels.opencodeModels, lastSelectedOpenCodeModelId],
+  )
+
+  useEffect(() => {
+    if (!selectedOpenCodeModel) return
+    const normalized = formatOpenCodeModelId({
+      providerID: selectedOpenCodeModel.providerID,
+      modelID: selectedOpenCodeModel.id,
+    })
+    if (lastSelectedOpenCodeModelId !== normalized) {
+      setLastSelectedOpenCodeModelId(normalized)
+    }
+  }, [lastSelectedOpenCodeModelId, selectedOpenCodeModel, setLastSelectedOpenCodeModelId])
 
   const selectedCodexThinking = useMemo<CodexThinkingLevel>(() => {
     if (
@@ -401,11 +459,20 @@ export function NewChatForm({
     if (selectedAgent.id === "codex") {
       return `${selectedCodexModel.id}/${selectedCodexThinking}`
     }
+    if (selectedAgent.id === "opencode") {
+      return selectedOpenCodeModel
+        ? formatOpenCodeModelId({
+            providerID: selectedOpenCodeModel.providerID,
+            modelID: selectedOpenCodeModel.id,
+          })
+        : ""
+    }
     return selectedModel?.id ?? "opus"
   }, [
     selectedAgent.id,
     selectedCodexModel.id,
     selectedCodexThinking,
+    selectedOpenCodeModel?.id,
     selectedModel?.id,
   ])
 
@@ -416,6 +483,12 @@ export function NewChatForm({
   const selectedModelLabel = useMemo(() => {
     if (selectedAgent.id === "codex") {
       return selectedCodexModel.name
+    }
+
+    if (selectedAgent.id === "opencode") {
+      return selectedOpenCodeModel
+        ? `${selectedOpenCodeModel.providerName} / ${selectedOpenCodeModel.name}`
+        : "Select model"
     }
 
     if (availableModels.isOffline && availableModels.hasOllama) {
@@ -434,6 +507,7 @@ export function NewChatForm({
   }, [
     selectedAgent.id,
     selectedCodexModel.name,
+    selectedOpenCodeModel,
     availableModels.isOffline,
     availableModels.hasOllama,
     currentOllamaModel,
@@ -1873,12 +1947,14 @@ export function NewChatForm({
                         <AgentModelSelector
                           open={isModelDropdownOpen}
                           onOpenChange={setIsModelDropdownOpen}
-                          selectedAgentId={selectedAgent.id as "claude-code" | "codex"}
+                          selectedAgentId={selectedAgent.id as "claude-code" | "codex" | "opencode"}
                           onSelectedAgentIdChange={(provider) => {
                             if (provider === "claude-code") {
                               setSelectedAgent(claudeAgent)
-                            } else {
+                            } else if (provider === "codex") {
                               setSelectedAgent(enabledAgents.find((agent) => agent.id === "codex") || fallbackAgent)
+                            } else {
+                              setSelectedAgent(enabledAgents.find((agent) => agent.id === "opencode") || fallbackAgent)
                             }
                             setLastSelectedAgentId(provider)
                           }}
@@ -1928,6 +2004,18 @@ export function NewChatForm({
                             selectedThinking: selectedCodexThinking,
                             onSelectThinking: setLastSelectedCodexThinking,
                             isConnected: codexOnboardingCompleted,
+                          }}
+                          opencode={{
+                            models: availableModels.opencodeModels,
+                            selectedModelId:
+                              selectedOpenCodeModel
+                                ? formatOpenCodeModelId({
+                                    providerID: selectedOpenCodeModel.providerID,
+                                    modelID: selectedOpenCodeModel.id,
+                                  })
+                                : lastSelectedOpenCodeModelId,
+                            onSelectModel: setLastSelectedOpenCodeModelId,
+                            isConnected: true,
                           }}
                         />
                       </div>

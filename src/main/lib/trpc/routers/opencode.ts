@@ -6,17 +6,16 @@
  * src/main/lib/opencode/transform.ts for the event-normalization heart
  * of this integration.
  *
- * Walking-skeleton scope (intentional cut lines):
+ * Current scope:
  *   - One shared opencode server per app (not per sub-chat)
  *   - One SSE subscription per chat turn (not a multiplexed global one)
  *   - No MCP plumbing, no permission approval wiring
- *   - No model/provider selection — uses whatever opencode's default is
  *   - No image attachments
  *   - No session resume across turns (creates a fresh opencode session
  *     per turn when no sessionId is provided)
  *
- * These are all cleanly extendable once the basic end-to-end pipeline
- * is verified working.
+ * The router also exposes provider/catalog discovery so the renderer can
+ * present OpenCode as a first-class provider instead of a placeholder.
  */
 
 import { observable } from "@trpc/server/observable"
@@ -26,10 +25,17 @@ import {
   createTransformer,
   ensureOpencodeServer,
   logRawOpencodeEvent,
-  subscribeOpencodeEvents,
+  replayAssistantSnapshot,
   shutdownOpencodeServer,
+  subscribeOpencodeEvents,
   type OpencodeSseSubscription,
 } from "../../opencode"
+import {
+  buildOpenCodeCatalog,
+  flattenOpenCodeCatalog,
+  pickDefaultOpenCodeModel,
+  type OpenCodeProviderCatalog,
+} from "../../../../shared/opencode-catalog"
 import type { UIMessageChunk } from "../../claude"
 
 type ActiveOpencodeStream = {
@@ -62,6 +68,51 @@ export function shutdownOpencodeIntegration(): void {
   shutdownOpencodeServer()
 }
 
+async function readOpenCodeCatalog() {
+  const server = await ensureOpencodeServer()
+  return readOpenCodeCatalogFromServer(server)
+}
+
+async function readOpenCodeCatalogFromServer(
+  server: Awaited<ReturnType<typeof ensureOpencodeServer>>,
+) {
+  const [providersResult, authResult] = await Promise.all([
+    server.client.provider.list({ throwOnError: true }),
+    server.client.provider.auth({ throwOnError: true }),
+  ])
+
+  const rawProviders = providersResult.data?.all ?? []
+  const connectedProviders = new Set(providersResult.data?.connected ?? [])
+  const authMethods = authResult.data ?? {}
+  const catalog = buildOpenCodeCatalog({
+    all: rawProviders.map((provider) => ({
+      id: provider.id,
+      name: provider.name,
+      connected: connectedProviders.has(provider.id),
+      models: Object.values(provider.models ?? {}).map((model) => ({
+        id: model.id,
+        name: model.name,
+        status: model.status,
+        experimental: model.experimental,
+      })),
+    })),
+    authMethods,
+  })
+  const connectedCatalog = catalog.filter((provider) => provider.connected)
+
+  console.log(
+    `[opencode] catalog providers=${connectedCatalog.length}/${catalog.length} models=${connectedCatalog.reduce((sum, provider) => sum + provider.models.length, 0)}/${catalog.reduce((sum, provider) => sum + provider.models.length, 0)} url=${server.handle.url}`,
+  )
+
+  return {
+    state: "connected" as const,
+    url: server.handle.url,
+    providers: connectedCatalog,
+    models: flattenOpenCodeCatalog(connectedCatalog),
+    defaultModelId: pickDefaultOpenCodeModel(connectedCatalog)?.id ?? null,
+  }
+}
+
 export const opencodeRouter = router({
   /**
    * Stream a chat turn against opencode.
@@ -84,6 +135,12 @@ export const opencodeRouter = router({
         runId: z.string(),
         prompt: z.string(),
         cwd: z.string(),
+        model: z
+          .object({
+            providerID: z.string(),
+            modelID: z.string(),
+          })
+          .optional(),
         sessionId: z.string().optional(),
         mode: z.enum(["plan", "agent"]).default("agent"),
       }),
@@ -109,10 +166,12 @@ export const opencodeRouter = router({
 
         let isObservableActive = true
         let finished = false
+        let emittedChunkCount = 0
 
         const safeEmit = (chunk: UIMessageChunk) => {
           if (!isObservableActive) return
           try {
+            emittedChunkCount += 1
             emit.next(chunk)
           } catch {
             isObservableActive = false
@@ -180,7 +239,7 @@ export const opencodeRouter = router({
                   `[opencode] SSE open for sub=${input.subChatId.slice(-8)} session=${sessionId}`,
                 )
               },
-              onEvent: (event) => {
+              onEvent: (event: any) => {
                 void logRawOpencodeEvent(sessionId!, event)
                 try {
                   for (const chunk of transform(event)) {
@@ -195,41 +254,81 @@ export const opencodeRouter = router({
                   emitError("transform error", err)
                 }
               },
-              onError: (error) => {
+              onError: (error: unknown) => {
                 if (controller.signal.aborted) return
                 emitError("SSE error", error)
                 safeComplete()
               },
             })
+            await active.sseSub.ready
 
             // 5. Fire the prompt. opencode will then emit message.updated
-            //    and part updates on the SSE stream we just opened.
+            //    and part updates on the SSE stream we now know is live.
+            console.log(
+              "[opencode] prompt",
+              JSON.stringify({
+                subChatId: input.subChatId.slice(-8),
+                sessionId,
+                mode: input.mode,
+                model: input.model ?? null,
+                promptPreview: input.prompt.slice(0, 120),
+              }),
+            )
             await server.client.session.prompt(
               {
-                sessionID: sessionId,
-                directory: input.cwd,
-                parts: [{ type: "text", text: input.prompt }],
+                path: { id: sessionId },
+                query: { directory: input.cwd },
+                body: {
+                  ...(input.model ? { model: input.model } : {}),
+                  parts: [{ type: "text", text: input.prompt }],
+                },
               },
               { throwOnError: true },
             )
 
-            // After session.prompt resolves the turn has technically
-            // finished on the server, but the SSE stream may still be
-            // flushing the last part.updated / message.updated. The
-            // transform's `finish` chunk (emitted when message.updated
-            // carries `time.completed`) is the authoritative stop signal
-            // and triggers safeComplete() via onEvent above.
-            //
-            // As a safety net, if the SSE stream never emits finish within
-            // a reasonable grace period after prompt resolved, force-close.
-            setTimeout(() => {
-              if (!finished) {
-                console.warn(
-                  `[opencode] forcing completion after prompt resolved without finish event (sub=${input.subChatId.slice(-8)})`,
+            // session.prompt resolves before the model's SSE stream is
+            // necessarily done, especially for local providers. We leave
+            // completion entirely to the SSE `finish` event so slower
+            // models aren't cut off prematurely. If the SSE stream never
+            // produces any usable chunks, fall back to replaying the
+            // stored assistant message snapshot from the session.
+            setTimeout(async () => {
+              if (finished || emittedChunkCount > 0 || !isObservableActive) return
+
+              try {
+                const messagesResult = await server.client.session.messages(
+                  {
+                    path: { id: sessionId! },
+                    query: { directory: input.cwd },
+                  },
+                  { throwOnError: true },
                 )
+                const messages = (messagesResult.data ?? []) as Array<{
+                  info?: { role?: string; id?: string }
+                  parts?: any[]
+                }>
+                const assistantMessage = [...messages]
+                  .reverse()
+                  .find((message) => message.info?.role === "assistant")
+
+                if (!assistantMessage?.info || !assistantMessage.parts) return
+
+                console.warn(
+                  `[opencode] replaying stored assistant snapshot for sub=${input.subChatId.slice(-8)} session=${sessionId}`,
+                )
+                for (const chunk of replayAssistantSnapshot({
+                  sessionId,
+                  info: assistantMessage.info as any,
+                  parts: assistantMessage.parts as any,
+                })) {
+                  safeEmit(chunk)
+                }
+                safeComplete()
+              } catch (error) {
+                emitError("snapshot replay failed", error)
                 safeComplete()
               }
-            }, 5_000)
+            }, 750)
           } catch (error) {
             if (controller.signal.aborted || active.cancelRequested) {
               safeComplete()
@@ -314,6 +413,21 @@ export const opencodeRouter = router({
       return {
         state: "not_installed" as const,
         error: message,
+      }
+    }
+  }),
+
+  getCatalog: publicProcedure.query(async () => {
+    try {
+      return await readOpenCodeCatalog()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        state: "not_installed" as const,
+        error: message,
+        providers: [] as OpenCodeProviderCatalog[],
+        models: [],
+        defaultModelId: null,
       }
     }
   }),

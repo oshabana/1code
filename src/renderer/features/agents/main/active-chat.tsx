@@ -145,6 +145,7 @@ import {
   agentsSidebarOpenAtom,
   subChatCodexModelIdAtomFamily,
   subChatCodexThinkingAtomFamily,
+  subChatOpenCodeModelIdAtomFamily,
   subChatModelIdAtomFamily,
   subChatModeAtomFamily,
   suppressInputFocusAtom,
@@ -3515,6 +3516,10 @@ const ChatViewInner = memo(function ChatViewInner({
           subChatCodexThinkingAtomFamily(newSubChat.id),
           appStore.get(subChatCodexThinkingAtomFamily(subChatId)),
         )
+        appStore.set(
+          subChatOpenCodeModelIdAtomFamily(newSubChat.id),
+          appStore.get(subChatOpenCodeModelIdAtomFamily(subChatId)),
+        )
 
         // Open the forked sub-chat tab and switch to it
         store.addToOpenSubChats(newSubChat.id)
@@ -4564,6 +4569,10 @@ const ChatViewInner = memo(function ChatViewInner({
         appStore.set(
           subChatCodexThinkingAtomFamily(newId),
           appStore.get(subChatCodexThinkingAtomFamily(subChatId)),
+        )
+        appStore.set(
+          subChatOpenCodeModelIdAtomFamily(newId),
+          appStore.get(subChatOpenCodeModelIdAtomFamily(subChatId)),
         )
 
         // 4. Store pending chat history for the new sub-chat to consume on mount
@@ -6914,6 +6923,10 @@ Make sure to preserve all functionality from both branches when resolving confli
     appStore.set(
       subChatCodexThinkingAtomFamily(newId),
       appStore.get(subChatCodexThinkingAtomFamily(sourceSubChatId)),
+    )
+    appStore.set(
+      subChatOpenCodeModelIdAtomFamily(newId),
+      appStore.get(subChatOpenCodeModelIdAtomFamily(sourceSubChatId)),
     )
 
     // Add to open tabs and set as active

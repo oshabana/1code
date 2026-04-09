@@ -57,9 +57,11 @@ import { cn } from "../../../lib/utils"
 import {
   lastSelectedCodexModelIdAtom,
   lastSelectedCodexThinkingAtom,
+  lastSelectedOpenCodeModelIdAtom,
   lastSelectedModelIdAtom,
   subChatCodexModelIdAtomFamily,
   subChatCodexThinkingAtomFamily,
+  subChatOpenCodeModelIdAtomFamily,
   subChatModelIdAtomFamily,
   subChatModeAtomFamily,
   getNextMode,
@@ -80,6 +82,8 @@ import {
   CODEX_MODELS,
   type CodexThinkingLevel,
 } from "../lib/models"
+import type { OpenCodeModelOption } from "../../../../shared/opencode-catalog"
+import { formatOpenCodeModelId } from "../../../../shared/opencode-catalog"
 import type { DiffTextContext, SelectedTextContext } from "../lib/queue-utils"
 import {
   AgentsFileMention,
@@ -106,9 +110,24 @@ import { getResolvedHotkey } from "../../../lib/hotkeys"
 import { customHotkeysAtom } from "../../../lib/atoms"
 import { toast } from "sonner"
 
+type AvailableModels = {
+  models: typeof CLAUDE_MODELS
+  opencodeModels: OpenCodeModelOption[]
+  ollamaModels: string[]
+  recommendedModel?: string
+  isOffline: boolean
+  hasOllama: boolean
+}
+
+const SUBSCRIPTION_ONLY_CODEX_MODEL_IDS = new Set([
+  "gpt-5.3-codex",
+])
+
 // Hook to get available models (including offline models if Ollama is available and debug enabled)
-function useAvailableModels() {
+function useAvailableModels(): AvailableModels {
   const showOfflineFeatures = useAtomValue(showOfflineModeFeaturesAtom)
+  const hiddenModels = useAtomValue(hiddenModelsAtom)
+  const { data: opencodeCatalog } = trpc.opencode.getCatalog.useQuery()
   const { data: ollamaStatus } = trpc.ollama.getStatus.useQuery(undefined, {
     refetchInterval: showOfflineFeatures ? 30000 : false,
     enabled: showOfflineFeatures, // Only query Ollama when offline mode is enabled
@@ -128,6 +147,9 @@ function useAvailableModels() {
   if (showOfflineFeatures && hasOllama && isOffline) {
     return {
       models: baseModels,
+      opencodeModels: (opencodeCatalog?.models || []).filter(
+        (model) => !hiddenModels.includes(model.id),
+      ),
       ollamaModels,
       recommendedModel,
       isOffline,
@@ -137,6 +159,9 @@ function useAvailableModels() {
 
   return {
     models: baseModels,
+    opencodeModels: (opencodeCatalog?.models || []).filter(
+      (model) => !hiddenModels.includes(model.id),
+    ),
     ollamaModels: [] as string[],
     recommendedModel: undefined as string | undefined,
     isOffline,
@@ -472,9 +497,17 @@ export const ChatInputArea = memo(function ChatInputArea({
   const [selectedSubChatCodexThinking, setSelectedSubChatCodexThinking] = useAtom(
     subChatCodexThinkingAtom,
   )
+  const subChatOpenCodeModelIdAtom = useMemo(
+    () => subChatOpenCodeModelIdAtomFamily(subChatId),
+    [subChatId],
+  )
+  const [selectedSubChatOpenCodeModelId, setSelectedSubChatOpenCodeModelId] = useAtom(
+    subChatOpenCodeModelIdAtom,
+  )
   const setLastSelectedModelId = useSetAtom(lastSelectedModelIdAtom)
   const setLastSelectedCodexModelId = useSetAtom(lastSelectedCodexModelIdAtom)
   const setLastSelectedCodexThinking = useSetAtom(lastSelectedCodexThinkingAtom)
+  const setLastSelectedOpenCodeModelId = useSetAtom(lastSelectedOpenCodeModelIdAtom)
   const [selectedOllamaModel, setSelectedOllamaModel] = useAtom(selectedOllamaModelAtom)
   const availableModels = useAvailableModels()
   const [selectedModel, setSelectedModel] = useState(
@@ -512,7 +545,9 @@ export const ChatInputArea = memo(function ChatInputArea({
   const codexUiModels = useMemo(
     () => {
       let models = hasAppCodexApiKey
-        ? CODEX_MODELS.filter((model) => model.id !== "gpt-5.3-codex")
+        ? CODEX_MODELS.filter(
+            (model) => !SUBSCRIPTION_ONLY_CODEX_MODEL_IDS.has(model.id),
+          )
         : CODEX_MODELS
       return models.filter((model) => !hiddenModels.includes(model.id))
     },
@@ -525,6 +560,40 @@ export const ChatInputArea = memo(function ChatInputArea({
       CODEX_MODELS[0]!,
     [codexUiModels, selectedSubChatCodexModelId],
   )
+
+  const selectedOpenCodeModel = useMemo(
+    () =>
+      availableModels.opencodeModels.find(
+        (model) => model.id === selectedSubChatOpenCodeModelId,
+      ) ||
+      availableModels.opencodeModels.find(
+        (model) =>
+          formatOpenCodeModelId({
+            providerID: model.providerID,
+            modelID: model.id,
+          }) === selectedSubChatOpenCodeModelId,
+      ) ||
+      availableModels.opencodeModels[0] ||
+      null,
+    [availableModels.opencodeModels, selectedSubChatOpenCodeModelId],
+  )
+
+  useEffect(() => {
+    if (!selectedOpenCodeModel) return
+    const normalized = formatOpenCodeModelId({
+      providerID: selectedOpenCodeModel.providerID,
+      modelID: selectedOpenCodeModel.id,
+    })
+    if (selectedSubChatOpenCodeModelId !== normalized) {
+      setSelectedSubChatOpenCodeModelId(normalized)
+      setLastSelectedOpenCodeModelId(normalized)
+    }
+  }, [
+    selectedOpenCodeModel,
+    selectedSubChatOpenCodeModelId,
+    setLastSelectedOpenCodeModelId,
+    setSelectedSubChatOpenCodeModelId,
+  ])
 
   const selectedCodexThinking = useMemo<CodexThinkingLevel>(() => {
     if (
@@ -603,6 +672,12 @@ export const ChatInputArea = memo(function ChatInputArea({
       return selectedCodexModel.name
     }
 
+    if (provider === "opencode") {
+      return selectedOpenCodeModel
+        ? `${selectedOpenCodeModel.providerName} / ${selectedOpenCodeModel.name}`
+        : "Select model"
+    }
+
     if (availableModels.isOffline && availableModels.hasOllama) {
       return currentOllamaModel || "Ollama"
     }
@@ -619,6 +694,7 @@ export const ChatInputArea = memo(function ChatInputArea({
   }, [
     provider,
     selectedCodexModel.name,
+    selectedOpenCodeModel,
     availableModels.isOffline,
     availableModels.hasOllama,
     currentOllamaModel,
@@ -1155,8 +1231,9 @@ export const ChatInputArea = memo(function ChatInputArea({
       // Process other files - for text files, read content and add as file mention
       for (const file of otherFiles) {
         // Get file path using Electron's webUtils API (more reliable than file.path)
-        // @ts-expect-error - Electron's webUtils API
-        const filePath: string | undefined = window.webUtils?.getPathForFile?.(file) || (file as File & { path?: string }).path
+        const filePath: string | undefined =
+          (window as typeof window & { webUtils?: { getPathForFile?: (file: File) => string } }).webUtils?.getPathForFile?.(file) ||
+          (file as File & { path?: string }).path
 
         let mentionId: string
         let mentionPath: string
@@ -1607,6 +1684,21 @@ export const ChatInputArea = memo(function ChatInputArea({
                           setLastSelectedCodexThinking(thinking)
                         },
                         isConnected: codexOnboardingCompleted,
+                      }}
+                      opencode={{
+                        models: availableModels.opencodeModels,
+                        selectedModelId:
+                          selectedOpenCodeModel
+                            ? formatOpenCodeModelId({
+                                providerID: selectedOpenCodeModel.providerID,
+                                modelID: selectedOpenCodeModel.id,
+                              })
+                            : selectedSubChatOpenCodeModelId,
+                        onSelectModel: (modelId) => {
+                          setSelectedSubChatOpenCodeModelId(modelId)
+                          setLastSelectedOpenCodeModelId(modelId)
+                        },
+                        isConnected: true,
                       }}
                     />
                   </div>

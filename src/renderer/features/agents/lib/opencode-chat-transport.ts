@@ -14,7 +14,10 @@
 
 import type { ChatTransport, UIMessage } from "ai"
 import { toast } from "sonner"
+import { parseOpenCodeModelId } from "../../../../shared/opencode-catalog"
+import { appStore } from "../../../lib/jotai-store"
 import { trpcClient } from "../../../lib/trpc"
+import { subChatOpenCodeModelIdAtomFamily } from "../atoms"
 import type { AgentMessageMetadata } from "../ui/agent-message-usage"
 
 type UIMessageChunk = any
@@ -45,25 +48,58 @@ export class OpencodeChatTransport implements ChatTransport<UIMessage> {
       .find((message) => message.role === "assistant")
     const metadata = lastAssistant?.metadata as AgentMessageMetadata | undefined
     const sessionId = metadata?.sessionId
+    const selectedModelId = appStore.get(
+      subChatOpenCodeModelIdAtomFamily(this.config.subChatId),
+    )
+    const selectedModel = parseOpenCodeModelId(selectedModelId)
+
+    let sub: { unsubscribe: () => void } | null = null
+    let didUnsubscribe = false
+    let forcedUnsubscribeTimer: ReturnType<typeof setTimeout> | null = null
+    let resolveNext: ((result: { done: boolean; chunk?: UIMessageChunk }) => void) | null = null
+    let rejectNext: ((error: Error) => void) | null = null
+    let pendingChunks: UIMessageChunk[] = []
+    let streamDone = false
+    let streamError: Error | null = null
+
+    const clearForcedUnsubscribeTimer = () => {
+      if (!forcedUnsubscribeTimer) return
+      clearTimeout(forcedUnsubscribeTimer)
+      forcedUnsubscribeTimer = null
+    }
+
+    const safeUnsubscribe = () => {
+      if (didUnsubscribe) return
+      didUnsubscribe = true
+      clearForcedUnsubscribeTimer()
+      sub?.unsubscribe()
+    }
 
     return new ReadableStream({
       start: (controller) => {
         const runId = crypto.randomUUID()
-        let sub: { unsubscribe: () => void } | null = null
-        let didUnsubscribe = false
-        let forcedUnsubscribeTimer: ReturnType<typeof setTimeout> | null = null
 
-        const clearForcedUnsubscribeTimer = () => {
-          if (!forcedUnsubscribeTimer) return
-          clearTimeout(forcedUnsubscribeTimer)
-          forcedUnsubscribeTimer = null
-        }
-
-        const safeUnsubscribe = () => {
-          if (didUnsubscribe) return
-          didUnsubscribe = true
-          clearForcedUnsubscribeTimer()
-          sub?.unsubscribe()
+        const deliverNext = () => {
+          if (resolveNext == null) return
+          if (pendingChunks.length > 0) {
+            const chunk = pendingChunks.shift()!
+            const isFinish = chunk.type === "finish"
+            resolveNext({ done: false, chunk })
+            resolveNext = null
+            if (isFinish) {
+              streamDone = true
+            }
+            return
+          }
+          if (streamError) {
+            rejectNext?.(streamError)
+            rejectNext = null
+            return
+          }
+          if (streamDone) {
+            resolveNext({ done: true })
+            resolveNext = null
+          }
         }
 
         sub = trpcClient.opencode.chat.subscribe(
@@ -74,6 +110,14 @@ export class OpencodeChatTransport implements ChatTransport<UIMessage> {
             prompt,
             cwd: this.config.cwd,
             mode: this.config.mode,
+            ...(selectedModel
+              ? {
+                  model: {
+                    providerID: selectedModel.providerID,
+                    modelID: selectedModel.modelID,
+                  },
+                }
+              : {}),
             ...(sessionId ? { sessionId } : {}),
           },
           {
@@ -85,36 +129,33 @@ export class OpencodeChatTransport implements ChatTransport<UIMessage> {
                 })
               }
 
-              try {
-                controller.enqueue(chunk)
-              } catch {
-                // Stream already closed.
+              if (chunk.type === "finish") {
+                streamDone = true
               }
 
-              if (chunk.type === "finish") {
-                try {
-                  controller.close()
-                } catch {
-                  // Already closed.
-                }
+              if (resolveNext) {
+                const resolve = resolveNext
+                resolveNext = null
+                resolve({ done: false, chunk })
+              } else {
+                pendingChunks.push(chunk)
               }
             },
             onError: (error: Error) => {
               toast.error("opencode request failed", {
                 description: error.message,
               })
-              try {
-                controller.error(error)
-              } catch {
-                // Already closed.
+              streamError = error
+              if (rejectNext) {
+                rejectNext(error)
+                rejectNext = null
               }
               safeUnsubscribe()
             },
             onComplete: () => {
-              try {
-                controller.close()
-              } catch {
-                // Already closed.
+              streamDone = true
+              if (resolveNext) {
+                deliverNext()
               }
               safeUnsubscribe()
             },
@@ -128,10 +169,10 @@ export class OpencodeChatTransport implements ChatTransport<UIMessage> {
               // No-op — server may have already cleaned up.
             })
 
-          try {
-            controller.close()
-          } catch {
-            // Already closed.
+          streamDone = true
+          if (resolveNext) {
+            resolveNext({ done: true })
+            resolveNext = null
           }
 
           void (async () => {
@@ -145,6 +186,50 @@ export class OpencodeChatTransport implements ChatTransport<UIMessage> {
             }
           })()
         })
+      },
+      pull: async (controller) => {
+        // Deliver any queued chunks first.
+        if (pendingChunks.length > 0) {
+          const chunk = pendingChunks.shift()!
+          controller.enqueue(chunk)
+          if (chunk.type === "finish") {
+            // Wait for the consumer to process the finish chunk, then
+            // close on the next pull when the queue is drained.
+            streamDone = true
+          }
+          return
+        }
+
+        if (streamError) {
+          controller.error(streamError)
+          return
+        }
+
+        if (streamDone) {
+          controller.close()
+          return
+        }
+
+        const result = await new Promise<{ done: boolean; chunk?: UIMessageChunk }>((resolve, reject) => {
+          resolveNext = resolve
+          rejectNext = reject
+        })
+
+        if (result.done) {
+          controller.close()
+          return
+        }
+
+        if (result.chunk) {
+          controller.enqueue(result.chunk)
+          if (result.chunk.type === "finish") {
+            streamDone = true
+          }
+        }
+      },
+      cancel: () => {
+        streamDone = true
+        safeUnsubscribe()
       },
     })
   }

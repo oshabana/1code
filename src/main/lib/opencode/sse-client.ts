@@ -18,6 +18,8 @@ import type { OpencodeBusEvent } from "./types"
 export type OpencodeSseSubscription = {
   /** Abort the SSE stream and release resources. */
   close: () => void
+  /** Resolves once the SSE handshake is established. */
+  ready: Promise<void>
 }
 
 export type OpencodeSseHandlers = {
@@ -36,9 +38,18 @@ export function subscribeOpencodeEvents(
 ): OpencodeSseSubscription {
   const controller = new AbortController()
   let closed = false
+  let resolveReady: (() => void) | null = null
+  let rejectReady: ((error: Error) => void) | null = null
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve
+    rejectReady = reject
+  })
   const close = () => {
     if (closed) return
     closed = true
+    rejectReady?.(new Error("[opencode-sse] subscription closed before ready"))
+    rejectReady = null
+    resolveReady = null
     try {
       controller.abort()
     } catch {
@@ -56,19 +67,28 @@ export function subscribeOpencodeEvents(
       })
 
       if (!res.ok) {
-        handlers.onError(
-          new Error(
-            `[opencode-sse] ${url} returned HTTP ${res.status} ${res.statusText}`,
-          ),
+        const error = new Error(
+          `[opencode-sse] ${url} returned HTTP ${res.status} ${res.statusText}`,
         )
+        rejectReady?.(error)
+        rejectReady = null
+        resolveReady = null
+        handlers.onError(error)
         return
       }
 
       if (!res.body) {
-        handlers.onError(new Error("[opencode-sse] response has no body"))
+        const error = new Error("[opencode-sse] response has no body")
+        rejectReady?.(error)
+        rejectReady = null
+        resolveReady = null
+        handlers.onError(error)
         return
       }
 
+      resolveReady?.()
+      resolveReady = null
+      rejectReady = null
       handlers.onOpen?.()
 
       const reader = res.body.getReader()
@@ -115,9 +135,12 @@ export function subscribeOpencodeEvents(
       if (closed) return // abort during normal teardown
       const error = err instanceof Error ? err : new Error(String(err))
       if (error.name === "AbortError") return
+      rejectReady?.(error)
+      rejectReady = null
+      resolveReady = null
       handlers.onError(error)
     }
   })()
 
-  return { close }
+  return { close, ready }
 }

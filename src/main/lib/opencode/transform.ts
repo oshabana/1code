@@ -28,7 +28,7 @@
  *   tool   part state:pending/running  → tool-input-available
  *   tool   part state:completed         → tool-output-available
  *   tool   part state:error             → tool-output-error
- *   message.updated with time.completed → finish (with usage metadata)
+ *   message.updated with finish/time.completed → finish (with usage metadata)
  */
 
 import type {
@@ -66,6 +66,8 @@ type TransformState = {
   emittedToolInputs: Set<string>
   /** tool calls we've already surfaced terminal output for */
   emittedToolOutputs: Set<string>
+  /** stop processing once the turn has ended or failed */
+  ended: boolean
 }
 
 export function createTransformer(options: {
@@ -86,6 +88,7 @@ export function createTransformer(options: {
     pendingTextByPart: new Map(),
     emittedToolInputs: new Set(),
     emittedToolOutputs: new Set(),
+    ended: false,
   }
 
   /**
@@ -95,6 +98,10 @@ export function createTransformer(options: {
   return function* transform(
     event: OpencodeBusEvent,
   ): Generator<UIMessageChunk> {
+    if (state.ended) {
+      return
+    }
+
     // Filter: ignore events from other sessions entirely.
     const propSessionId = (event.properties as { sessionID?: string })
       ?.sessionID
@@ -109,6 +116,31 @@ export function createTransformer(options: {
       case "message.removed":
       case "message.part.removed":
         return
+
+      case "session.error": {
+        const error = (event.properties as {
+          error?: { name: string; data?: Record<string, unknown> }
+        }).error
+        const data = (error?.data || {}) as Record<string, unknown>
+        const message =
+          typeof data.message === "string" ? data.message : error?.name ?? "OpenCode error"
+
+        if (state.openTextParts.size > 0) {
+          for (const textId of state.openTextParts) {
+            yield { type: "text-end", id: textId }
+          }
+          state.openTextParts.clear()
+        }
+        if (state.stepStarted) {
+          yield { type: "finish-step" }
+          state.stepStarted = false
+        }
+
+        yield { type: "error", errorText: message }
+        yield { type: "finish" }
+        state.ended = true
+        return
+      }
 
       case "message.updated": {
         const info = (
@@ -133,8 +165,11 @@ export function createTransformer(options: {
           state.stepStarted = true
         }
 
-        // If the message reports `time.completed`, the turn is done.
-        if (info.time.completed !== undefined) {
+        // Some providers emit a terminal assistant update with `finish`
+        // before they backfill `time.completed`. Treat either signal as
+        // end-of-turn so the UI does not spin forever waiting for the
+        // later timestamp update.
+        if (info.time.completed !== undefined || info.finish !== undefined) {
           // Close any open text blocks before emitting finish.
           for (const textId of state.openTextParts) {
             yield { type: "text-end", id: textId }
@@ -146,24 +181,15 @@ export function createTransformer(options: {
             state.stepStarted = false
           }
 
-          const metadata: MessageMetadata = {
-            sessionId: state.sessionId,
-            inputTokens: info.tokens.input,
-            outputTokens: info.tokens.output,
-            cacheReadInputTokens: info.tokens.cache.read,
-            cacheCreationInputTokens: info.tokens.cache.write,
-            totalTokens:
-              info.tokens.total ??
-              info.tokens.input + info.tokens.output,
-            totalCostUsd: info.cost,
-            durationMs: Math.max(0, info.time.completed - info.time.created),
-            resultSubtype: info.error
-              ? `error:${info.error.name}`
-              : info.finish ?? "success",
-            finalTextId: state.lastTextPartId ?? undefined,
+          yield {
+            type: "finish",
+            messageMetadata: buildMessageMetadata({
+              sessionId: state.sessionId,
+              info,
+              finalTextId: state.lastTextPartId ?? undefined,
+            }),
           }
-
-          yield { type: "finish", messageMetadata: metadata }
+          state.ended = true
 
           // If opencode reported an error on the assistant message, also
           // surface it as an explicit `error` chunk so the UI can toast.
@@ -183,21 +209,9 @@ export function createTransformer(options: {
         const part = (event.properties as { part?: OpencodePart }).part
         if (!part) return
 
-        // Only forward parts belonging to the message we're tracking.
-        if (
-          state.targetMessageId !== null &&
-          part.messageID !== state.targetMessageId
-        ) {
+        // Only forward parts belonging to the assistant message we're tracking.
+        if (!state.targetMessageId || part.messageID !== state.targetMessageId) {
           return
-        }
-
-        // Ensure a "start" has been emitted even if part.updated arrives
-        // before the initial message.updated (defensive ordering).
-        if (!state.started) {
-          state.started = true
-          yield { type: "start", messageId: part.messageID }
-          yield { type: "start-step" }
-          state.stepStarted = true
         }
 
         if (part.type === "text") {
@@ -249,21 +263,11 @@ export function createTransformer(options: {
 
         // Ignore deltas for other messages.
         if (
-          state.targetMessageId !== null &&
-          props.messageID !== undefined &&
+          !state.targetMessageId ||
+          props.messageID === undefined ||
           props.messageID !== state.targetMessageId
         ) {
           return
-        }
-
-        if (!state.started) {
-          state.started = true
-          yield {
-            type: "start",
-            messageId: props.messageID ?? state.targetMessageId ?? undefined,
-          }
-          yield { type: "start-step" }
-          state.stepStarted = true
         }
 
         if (props.field === "text") {
@@ -304,6 +308,107 @@ export function createTransformer(options: {
         // captures them for debugging if OPENCODE_RAW_LOG=1.
         return
     }
+  }
+}
+
+export function replayAssistantSnapshot(options: {
+  sessionId: string
+  info: OpencodeAssistantMessageInfo
+  parts: OpencodePart[]
+}): UIMessageChunk[] {
+  const { sessionId, info, parts } = options
+  const chunks: UIMessageChunk[] = [
+    { type: "start", messageId: info.id },
+    { type: "start-step" },
+  ]
+
+  let finalTextId: string | undefined
+
+  for (const part of parts) {
+    if (part.type === "text") {
+      const textPart = part as OpencodeTextPart
+      if (textPart.synthetic || textPart.ignored) continue
+      finalTextId = textPart.id
+      chunks.push({ type: "text-start", id: textPart.id })
+      if (textPart.text) {
+        chunks.push({
+          type: "text-delta",
+          id: textPart.id,
+          delta: textPart.text,
+        })
+      }
+      chunks.push({ type: "text-end", id: textPart.id })
+      continue
+    }
+
+    if (part.type === "tool") {
+      const toolPart = part as OpencodeToolPart
+      const status = toolPart.state.status
+      chunks.push({
+        type: "tool-input-available",
+        toolCallId: toolPart.callID,
+        toolName: toolPart.tool,
+        input: toolPart.state.input,
+      })
+      if (status === "completed") {
+        chunks.push({
+          type: "tool-output-available",
+          toolCallId: toolPart.callID,
+          output: toolPart.state.output,
+        })
+      } else if (status === "error") {
+        chunks.push({
+          type: "tool-output-error",
+          toolCallId: toolPart.callID,
+          errorText: toolPart.state.error,
+        })
+      }
+    }
+  }
+
+  chunks.push({ type: "finish-step" })
+  chunks.push({
+    type: "finish",
+    messageMetadata: buildMessageMetadata({
+      sessionId,
+      info,
+      finalTextId,
+    }),
+  })
+
+  if (info.error) {
+    const data = (info.error.data || {}) as Record<string, unknown>
+    const message =
+      typeof data.message === "string" ? data.message : info.error.name
+    chunks.push({ type: "error", errorText: message })
+  }
+
+  return chunks
+}
+
+function buildMessageMetadata(options: {
+  sessionId: string
+  info: OpencodeAssistantMessageInfo
+  finalTextId?: string
+}): MessageMetadata {
+  const { sessionId, info, finalTextId } = options
+  return {
+    sessionId,
+    inputTokens: info.tokens.input,
+    outputTokens: info.tokens.output,
+    cacheReadInputTokens: info.tokens.cache.read,
+    cacheCreationInputTokens: info.tokens.cache.write,
+    totalTokens:
+      info.tokens.total ?? info.tokens.input + info.tokens.output,
+    totalCostUsd: info.cost,
+    durationMs:
+      info.time.completed !== undefined
+        ? Math.max(0, info.time.completed - info.time.created)
+        : 0,
+    resultSubtype: info.error
+      ? `error:${info.error.name}`
+      : info.finish ?? "success",
+    finalTextId,
   }
 }
 

@@ -220,7 +220,14 @@ export const lastSelectedModelIdAtom = atomWithStorage<string>(
 
 export const lastSelectedCodexModelIdAtom = atomWithStorage<string>(
   "agents:lastSelectedCodexModelId",
-  "gpt-5.3-codex",
+  "gpt-5.4",
+  undefined,
+  { getOnInit: true },
+)
+
+export const lastSelectedOpenCodeModelIdAtom = atomWithStorage<string>(
+  "agents:lastSelectedOpenCodeModelId",
+  "",
   undefined,
   { getOnInit: true },
 )
@@ -287,6 +294,34 @@ export const subChatCodexModelIdAtomFamily = atomFamily((subChatId: string) =>
       const current = get(subChatCodexModelIdsStorageAtom)
       if (current[subChatId] === newModelId) return
       set(subChatCodexModelIdsStorageAtom, { ...current, [subChatId]: newModelId })
+    },
+  ),
+)
+
+const subChatOpenCodeModelIdsStorageAtom = atomWithStorage<Record<string, string>>(
+  "agents:subChatOpenCodeModelIds",
+  {},
+  undefined,
+  { getOnInit: true },
+)
+
+export const subChatOpenCodeModelIdAtomFamily = atomFamily((subChatId: string) =>
+  atom(
+    (get) => {
+      if (!subChatId) return get(lastSelectedOpenCodeModelIdAtom)
+      return (
+        get(subChatOpenCodeModelIdsStorageAtom)[subChatId] ??
+        get(lastSelectedOpenCodeModelIdAtom)
+      )
+    },
+    (get, set, newModelId: string) => {
+      if (!subChatId) {
+        set(lastSelectedOpenCodeModelIdAtom, newModelId)
+        return
+      }
+      const current = get(subChatOpenCodeModelIdsStorageAtom)
+      if (current[subChatId] === newModelId) return
+      set(subChatOpenCodeModelIdsStorageAtom, { ...current, [subChatId]: newModelId })
     },
   ),
 )
