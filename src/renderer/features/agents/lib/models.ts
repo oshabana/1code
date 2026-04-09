@@ -33,3 +33,17 @@ export function formatCodexThinkingLabel(thinking: CodexThinkingLevel): string {
   if (thinking === "xhigh") return "Extra High"
   return thinking.charAt(0).toUpperCase() + thinking.slice(1)
 }
+
+/**
+ * opencode is a provider-agnostic agent — it routes to whatever model the
+ * user has configured via `opencode auth` / `~/.opencode`. From 1code's
+ * perspective it's a single "provider" with one placeholder model entry,
+ * since model selection happens inside opencode itself.
+ *
+ * Walking-skeleton note: if/when 1code adds a real opencode model picker,
+ * this can become a proper list populated from opencode's `/provider`
+ * HTTP endpoint.
+ */
+export const OPENCODE_MODELS = [
+  { id: "opencode", name: "opencode", version: "default" },
+] as const

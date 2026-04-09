@@ -169,6 +169,7 @@ import { usePastedTextFiles, type PastedTextFile } from "../hooks/use-pasted-tex
 import { useTextContextSelection } from "../hooks/use-text-context-selection"
 import { useToggleFocusOnCmdEsc } from "../hooks/use-toggle-focus-on-cmd-esc"
 import { ACPChatTransport } from "../lib/acp-chat-transport"
+import { OpencodeChatTransport } from "../lib/opencode-chat-transport"
 import { formatHistoryForContext } from "../lib/export-chat"
 import {
   clearSubChatDraft,
@@ -1940,13 +1941,13 @@ const ChatViewInner = memo(function ChatViewInner({
   chat: Chat<any>
   subChatId: string
   parentChatId: string
-  provider?: "claude-code" | "codex"
+  provider?: "claude-code" | "codex" | "opencode"
   isFirstSubChat: boolean
   onAutoRename: (userMessage: string, subChatId: string) => void
   onCreateNewSubChat?: () => void
   onProviderChange?: (
     subChatId: string,
-    provider: "claude-code" | "codex",
+    provider: "claude-code" | "codex" | "opencode",
   ) => void
   refreshDiff?: () => void
   teamId?: string
@@ -4518,7 +4519,7 @@ const ChatViewInner = memo(function ChatViewInner({
   const shouldShowStackedCards =
     !displayQuestions && (queue.length > 0 || shouldShowStatusCard)
   const handleInputProviderChange = useCallback(
-    (nextProvider: "claude-code" | "codex") => {
+    (nextProvider: "claude-code" | "codex" | "opencode") => {
       onProviderChange?.(subChatId, nextProvider)
     },
     [onProviderChange, subChatId],
@@ -4527,7 +4528,7 @@ const ChatViewInner = memo(function ChatViewInner({
   // Continue conversation with a different provider - creates new sub-chat with history attachment
   const isContinuingRef = useRef(false)
   const handleContinueWithProvider = useCallback(
-    async (targetProvider: "claude-code" | "codex") => {
+    async (targetProvider: "claude-code" | "codex" | "opencode") => {
       if (isStreaming || isContinuingRef.current) return
       if (!messages || messages.length === 0) return
       isContinuingRef.current = true
@@ -5304,7 +5305,7 @@ export function ChatView({
   const [
     subChatProviderOverrides,
     setSubChatProviderOverrides,
-  ] = useState<Record<string, "claude-code" | "codex">>({})
+  ] = useState<Record<string, "claude-code" | "codex" | "opencode">>({})
 
   useEffect(() => {
     setSubChatProviderOverrides({})
@@ -6377,7 +6378,7 @@ Make sure to preserve all functionality from both branches when resolving confli
   }, [agentSubChats, activeSubChatIdForPlan, setCurrentPlanPath])
 
   const inferProviderFromMessages = useCallback(
-    (subChatId?: string): "claude-code" | "codex" => {
+    (subChatId?: string): "claude-code" | "codex" | "opencode" => {
       if (!subChatId) return "claude-code"
 
       const override = subChatProviderOverrides[subChatId]
@@ -6404,6 +6405,9 @@ Make sure to preserve all functionality from both branches when resolving confli
         const model = (message as any)?.metadata?.model
         if (typeof model !== "string") continue
         const normalizedModel = model.toLowerCase()
+        if (normalizedModel.startsWith("opencode") || normalizedModel.startsWith("opencode/")) {
+          return "opencode"
+        }
         if (
           normalizedModel.includes("codex") ||
           normalizedModel.startsWith("gpt-")
@@ -6575,10 +6579,13 @@ Make sure to preserve all functionality from both branches when resolving confli
         const overrideProvider = subChatProviderOverrides[subChatId]
         if (!overrideProvider) return existing
 
-        const existingProvider: "claude-code" | "codex" =
-          (existing as any)?.transport instanceof ACPChatTransport
-            ? "codex"
-            : "claude-code"
+        const existingTransport = (existing as any)?.transport
+        const existingProvider: "claude-code" | "codex" | "opencode" =
+          existingTransport instanceof OpencodeChatTransport
+            ? "opencode"
+            : existingTransport instanceof ACPChatTransport
+              ? "codex"
+              : "claude-code"
         if (existingProvider === overrideProvider) return existing
 
         const subChatForOverride = agentSubChats.find((sc) => sc.id === subChatId)
@@ -6632,7 +6639,7 @@ Make sure to preserve all functionality from both branches when resolving confli
         worktreePath: worktreePath ? "exists" : "none",
       })
 
-      let transport: IPCChatTransport | RemoteChatTransport | ACPChatTransport | null = null
+      let transport: IPCChatTransport | RemoteChatTransport | ACPChatTransport | OpencodeChatTransport | null = null
 
       if (isRemoteChat && chatSandboxUrl) {
         // Remote sandbox chat: use HTTP SSE transport
@@ -6661,6 +6668,16 @@ Make sure to preserve all functionality from both branches when resolving confli
             projectPath,
             mode: subChatMode,
             provider: "codex",
+          })
+        } else if (chatProvider === "opencode") {
+          console.log("[getOrCreateChat] Using OpencodeChatTransport", { provider: chatProvider })
+          transport = new OpencodeChatTransport({
+            chatId,
+            subChatId,
+            cwd: worktreePath,
+            projectPath,
+            mode: subChatMode,
+            provider: "opencode",
           })
         } else {
           // Local worktree chat: use IPC transport
@@ -6782,7 +6799,7 @@ Make sure to preserve all functionality from both branches when resolving confli
   )
 
   const handleProviderChange = useCallback(
-    (subChatId: string, nextProvider: "claude-code" | "codex") => {
+    (subChatId: string, nextProvider: "claude-code" | "codex" | "opencode") => {
       // Provider switch is only allowed for brand new sub-chats.
       const activeChat = agentChatStore.get(subChatId) as any
       let messageCount = Array.isArray(activeChat?.messages)
@@ -6917,7 +6934,7 @@ Make sure to preserve all functionality from both branches when resolving confli
     })
 
     const chatProvider = newSubChatProvider
-    let newSubChatTransport: IPCChatTransport | RemoteChatTransport | ACPChatTransport | null = null
+    let newSubChatTransport: IPCChatTransport | RemoteChatTransport | ACPChatTransport | OpencodeChatTransport | null = null
 
     if (isNewSubChatRemote && newSubChatSandboxUrl) {
       // Remote sandbox chat: use HTTP SSE transport
@@ -6942,6 +6959,16 @@ Make sure to preserve all functionality from both branches when resolving confli
           projectPath,
           mode: newSubChatMode,
           provider: "codex",
+        })
+      } else if (chatProvider === "opencode") {
+        console.log("[createNewSubChat] Using OpencodeChatTransport", { provider: chatProvider })
+        newSubChatTransport = new OpencodeChatTransport({
+          chatId,
+          subChatId: newId,
+          cwd: worktreePath,
+          projectPath,
+          mode: newSubChatMode,
+          provider: "opencode",
         })
       } else {
         // Local worktree chat: use IPC transport

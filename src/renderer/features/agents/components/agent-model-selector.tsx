@@ -34,7 +34,7 @@ const CodexIcon = ({ className }: { className?: string }) => (
   </svg>
 )
 
-export type AgentProviderId = "claude-code" | "codex"
+export type AgentProviderId = "claude-code" | "codex" | "opencode"
 
 type ClaudeModelOption = {
   id: string
