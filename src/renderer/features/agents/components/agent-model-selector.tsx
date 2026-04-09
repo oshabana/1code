@@ -23,6 +23,7 @@ import {
   PopoverTrigger,
 } from "../../../components/ui/popover"
 import { cn } from "../../../lib/utils"
+import { formatOpenCodeModelId, type OpenCodeModelOption } from "../../../../shared/opencode-catalog"
 import type { CodexThinkingLevel } from "../lib/models"
 import { formatCodexThinkingLabel } from "../lib/models"
 
@@ -34,7 +35,16 @@ const CodexIcon = ({ className }: { className?: string }) => (
   </svg>
 )
 
-export type AgentProviderId = "claude-code" | "codex"
+// Simple OpenCode mark used until we wire in the upstream brand asset.
+const OpencodeIcon = ({ className }: { className?: string }) => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+    <path d="M8 4H4v16h4" />
+    <path d="M16 4h4v16h-4" />
+    <path d="M10 12h4" />
+  </svg>
+)
+
+export type AgentProviderId = "claude-code" | "codex" | "opencode"
 
 type ClaudeModelOption = {
   id: string
@@ -81,6 +91,12 @@ interface AgentModelSelectorProps {
     onSelectThinking: (thinking: CodexThinkingLevel) => void
     isConnected: boolean
   }
+  opencode: {
+    models: OpenCodeModelOption[]
+    selectedModelId: string
+    onSelectModel: (modelId: string) => void
+    isConnected: boolean
+  }
 }
 
 type FlatModelItem =
@@ -88,6 +104,7 @@ type FlatModelItem =
   | { type: "codex"; model: CodexModelOption }
   | { type: "ollama"; modelName: string; isRecommended: boolean }
   | { type: "custom" }
+  | { type: "opencode"; model: OpenCodeModelOption }
 
 function CodexThinkingSubMenu({
   thinkings,
@@ -102,14 +119,17 @@ function CodexThinkingSubMenu({
   const subMenuRef = useRef<HTMLDivElement>(null)
   const [showSub, setShowSub] = useState(false)
   const [subPos, setSubPos] = useState({ top: 0, left: 0 })
-  const closeTimeout = useRef<ReturnType<typeof setTimeout>>()
+  const closeTimeout = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const scheduleClose = useCallback(() => {
     closeTimeout.current = setTimeout(() => setShowSub(false), 150)
   }, [])
 
   const cancelClose = useCallback(() => {
-    clearTimeout(closeTimeout.current)
+    if (closeTimeout.current) {
+      clearTimeout(closeTimeout.current)
+      closeTimeout.current = null
+    }
   }, [])
 
   const handleTriggerEnter = useCallback(() => {
@@ -146,7 +166,11 @@ function CodexThinkingSubMenu({
   )
 
   useEffect(() => {
-    return () => clearTimeout(closeTimeout.current)
+    return () => {
+      if (closeTimeout.current) {
+        clearTimeout(closeTimeout.current)
+      }
+    }
   }, [])
 
   return (
@@ -323,6 +347,7 @@ export function AgentModelSelector({
   onContinueWithProvider,
   claude,
   codex,
+  opencode,
 }: AgentModelSelectorProps) {
   const [search, setSearch] = useState("")
   const [confirmDialogOpen, setConfirmDialogOpen] = useState(false)
@@ -355,8 +380,12 @@ export function AgentModelSelector({
       items.push({ type: "codex", model: m })
     }
 
+    for (const m of opencode.models) {
+      items.push({ type: "opencode", model: m })
+    }
+
     return items
-  }, [claude, codex])
+  }, [claude, codex, opencode])
 
   // Filter by search
   const filteredModels = useMemo(() => {
@@ -376,6 +405,12 @@ export function AgentModelSelector({
           return item.modelName.toLowerCase().includes(q)
         case "custom":
           return "custom model".includes(q)
+        case "opencode":
+          return (
+            item.model.name.toLowerCase().includes(q) ||
+            item.model.providerName.toLowerCase().includes(q) ||
+            item.model.id.toLowerCase().includes(q)
+          )
       }
     })
   }, [allModels, search])
@@ -391,9 +426,11 @@ export function AgentModelSelector({
   )
 
   const triggerIcon =
-    selectedAgentId === "claude-code" &&
-    claude.isOffline &&
-    claude.ollamaModels.length > 0 ? (
+    selectedAgentId === "opencode" ? (
+      <OpencodeIcon className="h-3.5 w-3.5" />
+    ) : selectedAgentId === "claude-code" &&
+      claude.isOffline &&
+      claude.ollamaModels.length > 0 ? (
       <Zap className="h-4 w-4" />
     ) : selectedAgentId === "codex" ? (
       <CodexIcon className="h-3.5 w-3.5" />
@@ -411,11 +448,21 @@ export function AgentModelSelector({
         return selectedAgentId === "claude-code" && claude.selectedOllamaModel === item.modelName
       case "custom":
         return selectedAgentId === "claude-code"
+      case "opencode":
+        return (
+          selectedAgentId === "opencode" &&
+          opencode.selectedModelId === formatOpenCodeModelId({
+            providerID: item.model.providerID,
+            modelID: item.model.id,
+          })
+        )
     }
   }
 
   const getItemProvider = (item: FlatModelItem): AgentProviderId => {
-    return item.type === "codex" ? "codex" : "claude-code"
+    if (item.type === "codex") return "codex"
+    if (item.type === "opencode") return "opencode"
+    return "claude-code"
   }
 
   const isItemDisabled = (item: FlatModelItem): boolean => {
@@ -456,6 +503,20 @@ export function AgentModelSelector({
 
     // Cross-provider click → show confirmation or continue directly
     if (!canSelectProvider(provider) && onContinueWithProvider) {
+      if (item.type === "claude") {
+        claude.onSelectModel(item.model.id)
+      } else if (item.type === "codex") {
+        codex.onSelectModel(item.model.id)
+      } else if (item.type === "ollama") {
+        claude.onSelectOllamaModel(item.modelName)
+      } else if (item.type === "opencode") {
+        opencode.onSelectModel(
+          formatOpenCodeModelId({
+            providerID: item.model.providerID,
+            modelID: item.model.id,
+          }),
+        )
+      }
       handleOpenChange(false)
       const dismissed = (() => {
         try { return localStorage.getItem(CROSS_PROVIDER_DIALOG_DISMISSED_KEY) === "true" } catch { return false }
@@ -489,6 +550,16 @@ export function AgentModelSelector({
         if (!canSelectProvider("claude-code")) return
         onSelectedAgentIdChange("claude-code")
         break
+      case "opencode":
+        if (!canSelectProvider("opencode")) return
+        onSelectedAgentIdChange("opencode")
+        opencode.onSelectModel(
+          formatOpenCodeModelId({
+            providerID: item.model.providerID,
+            modelID: item.model.id,
+          }),
+        )
+        break
     }
     handleOpenChange(false)
   }
@@ -503,6 +574,8 @@ export function AgentModelSelector({
         return <Zap className="h-4 w-4 text-muted-foreground shrink-0" />
       case "custom":
         return <ClaudeCodeIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+      case "opencode":
+        return <OpencodeIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
     }
   }
 
@@ -516,6 +589,8 @@ export function AgentModelSelector({
         return item.modelName + (item.isRecommended ? " (recommended)" : "")
       case "custom":
         return "Custom Model"
+      case "opencode":
+        return `${item.model.providerName} / ${item.model.name}`
     }
   }
 
@@ -529,6 +604,8 @@ export function AgentModelSelector({
         return `ollama-${item.modelName}`
       case "custom":
         return "custom"
+      case "opencode":
+        return `opencode-${item.model.providerID}-${item.model.id}`
     }
   }
 
@@ -648,7 +725,13 @@ export function AgentModelSelector({
 
       <CrossProviderConfirmDialog
         isOpen={confirmDialogOpen}
-        providerName={pendingProvider === "codex" ? "Codex" : "Claude Code"}
+        providerName={
+          pendingProvider === "codex"
+            ? "Codex"
+            : pendingProvider === "opencode"
+              ? "OpenCode"
+              : "Claude Code"
+        }
         onConfirm={handleConfirmCrossProvider}
         onClose={handleCloseConfirmDialog}
       />

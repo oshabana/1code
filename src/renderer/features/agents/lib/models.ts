@@ -8,6 +8,16 @@ export type CodexThinkingLevel = "low" | "medium" | "high" | "xhigh"
 
 export const CODEX_MODELS = [
   {
+    id: "gpt-5.4",
+    name: "GPT-5.4",
+    thinkings: ["low", "medium", "high", "xhigh"] as CodexThinkingLevel[],
+  },
+  {
+    id: "gpt-5.4-mini",
+    name: "GPT-5.4 mini",
+    thinkings: ["medium", "high"] as CodexThinkingLevel[],
+  },
+  {
     id: "gpt-5.3-codex",
     name: "Codex 5.3",
     thinkings: ["low", "medium", "high", "xhigh"] as CodexThinkingLevel[],
@@ -33,3 +43,9 @@ export function formatCodexThinkingLabel(thinking: CodexThinkingLevel): string {
   if (thinking === "xhigh") return "Extra High"
   return thinking.charAt(0).toUpperCase() + thinking.slice(1)
 }
+
+/**
+ * OpenCode models are discovered dynamically through the SDK catalog.
+ * Keep the shared model helpers in `src/shared/opencode-catalog.ts` instead
+ * of hard-coding a static placeholder list here.
+ */

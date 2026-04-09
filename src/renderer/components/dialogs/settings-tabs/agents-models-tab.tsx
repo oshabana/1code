@@ -35,6 +35,22 @@ import { Input } from "../../ui/input"
 import { Label } from "../../ui/label"
 import { Switch } from "../../ui/switch"
 
+const OpenCodeIcon = ({ className }: { className?: string }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+  >
+    <path d="M8 4H4v16h4" />
+    <path d="M16 4h4v16h-4" />
+    <path d="M10 12h4" />
+  </svg>
+)
+
 // Hook to detect narrow screen
 function useIsNarrowScreen(): boolean {
   const [isNarrow, setIsNarrow] = useState(false)
@@ -274,6 +290,14 @@ export function AgentsModelsTab() {
   const isClaudeCodeConnected = claudeCodeIntegration?.isConnected
   const { data: codexIntegration, isLoading: isCodexLoading } =
     trpc.codex.getIntegration.useQuery()
+  const {
+    data: opencodeCatalog,
+    isLoading: isOpenCodeLoading,
+    isFetching: isRefreshingOpenCodeCatalog,
+    refetch: refetchOpenCodeCatalog,
+  } = trpc.opencode.getCatalog.useQuery(undefined, {
+    placeholderData: (previous) => previous,
+  })
 
   // OpenAI API key state
   const [storedCodexApiKey, setStoredCodexApiKey] = useAtom(codexApiKeyAtom)
@@ -382,6 +406,13 @@ export function AgentsModelsTab() {
   const isCodexSubscriptionActive =
     isCodexSubscriptionConnected && !hasAppCodexApiKey
   const [hiddenModels, setHiddenModels] = useAtom(hiddenModelsAtom)
+  const openCodeModels = (opencodeCatalog?.models ?? []) as Array<{
+    id: string
+    name: string
+    providerName: string
+  }>
+  const openCodeProviderCount = opencodeCatalog?.providers?.length ?? 0
+  const openCodeModelCount = opencodeCatalog?.models?.length ?? 0
 
   const toggleModelVisibility = useCallback((modelId: string) => {
     setHiddenModels((prev) => {
@@ -485,15 +516,18 @@ export function AgentsModelsTab() {
 
   // All models merged into one list for the top section
   const allModels = useMemo(() => {
-    const items: { id: string; name: string; provider: "claude" | "codex" }[] = []
+    const items: { id: string; name: string; provider: "claude" | "codex" | "opencode" }[] = []
     for (const m of CLAUDE_MODELS) {
       items.push({ id: m.id, name: `${m.name} ${m.version}`, provider: "claude" })
     }
     for (const m of CODEX_MODELS) {
       items.push({ id: m.id, name: m.name, provider: "codex" })
     }
+    for (const m of openCodeModels) {
+      items.push({ id: m.id, name: `${m.providerName} / ${m.name}`, provider: "opencode" })
+    }
     return items
-  }, [])
+  }, [openCodeModels])
 
   const [modelSearch, setModelSearch] = useState("")
   const filteredModels = useMemo(() => {
@@ -535,15 +569,17 @@ export function AgentsModelsTab() {
               const isEnabled = !hiddenModels.includes(m.id)
               return (
                 <div
-                  key={m.id}
+                  key={`${m.provider}-${m.id}`}
                   className="flex items-center justify-between px-4 py-3"
                 >
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-medium">{m.name}</span>
                     {m.provider === "claude" ? (
                       <ClaudeCodeIcon className="h-3.5 w-3.5 text-muted-foreground" />
-                    ) : (
+                    ) : m.provider === "codex" ? (
                       <CodexIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                    ) : (
+                      <OpenCodeIcon className="h-3.5 w-3.5 text-muted-foreground" />
                     )}
                   </div>
                   <Switch
@@ -559,6 +595,97 @@ export function AgentsModelsTab() {
               </div>
             )}
           </div>
+        </div>
+      </div>
+
+      {/* ===== OpenCode Section ===== */}
+      <div className="space-y-2">
+        <div className="pb-2 flex items-center justify-between">
+          <div>
+            <h4 className="text-sm font-medium text-foreground">
+              OpenCode Providers
+            </h4>
+            <p className="text-xs text-muted-foreground">
+              Models and auth sources discovered from your OpenCode config
+            </p>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={async () => {
+              try {
+                await refetchOpenCodeCatalog()
+                toast.success("OpenCode providers refreshed")
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                toast.error("Failed to refresh OpenCode providers", {
+                  description: message,
+                })
+              }
+            }}
+            disabled={isOpenCodeLoading || isRefreshingOpenCodeCatalog}
+          >
+            {isRefreshingOpenCodeCatalog ? "Refreshing..." : "Refresh"}
+          </Button>
+        </div>
+
+        <div className="bg-background rounded-lg border border-border overflow-hidden divide-y divide-border">
+          {isOpenCodeLoading || isRefreshingOpenCodeCatalog ? (
+            <div className="p-4 text-center text-sm text-muted-foreground">
+              Loading OpenCode providers...
+            </div>
+          ) : opencodeCatalog?.state === "not_installed" ? (
+            <div className="p-4 space-y-2">
+              <div className="text-sm font-medium text-foreground">
+                OpenCode catalog unavailable
+              </div>
+              <div className="text-xs text-muted-foreground">
+                {opencodeCatalog.error ||
+                  "OpenCode did not return a catalog from this session."}
+              </div>
+            </div>
+          ) : (opencodeCatalog?.providers || []).length === 0 ? (
+            <div className="p-4 text-center text-sm text-muted-foreground">
+              No OpenCode providers found
+            </div>
+          ) : (
+            opencodeCatalog?.providers.map((provider: {
+              id: string
+              name: string
+              connected: boolean
+              models: Array<{ id: string }>
+              authMethods: Array<{ label: string }>
+            }) => (
+              <div
+                key={provider.id}
+                className="flex items-start justify-between gap-6 p-4 hover:bg-muted/50"
+              >
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm font-medium">{provider.name}</div>
+                    {provider.connected && (
+                      <Badge variant="secondary" className="text-xs">
+                        Connected
+                      </Badge>
+                    )}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {provider.models.length} model{provider.models.length === 1 ? "" : "s"}
+                    {provider.authMethods.length > 0
+                      ? ` · ${provider.authMethods.map((m: { label: string }) => m.label).join(", ")}`
+                      : ""}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <OpenCodeIcon className="h-4 w-4 text-muted-foreground" />
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+        <div className="text-xs text-muted-foreground">
+          {openCodeProviderCount} provider{openCodeProviderCount === 1 ? "" : "s"} ·{" "}
+          {openCodeModelCount} model{openCodeModelCount === 1 ? "" : "s"}
         </div>
       </div>
 
