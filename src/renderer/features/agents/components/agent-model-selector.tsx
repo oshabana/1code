@@ -34,6 +34,17 @@ const CodexIcon = ({ className }: { className?: string }) => (
   </svg>
 )
 
+// Minimal placeholder mark for opencode — a filled square-bracket glyph
+// suggestive of the opencode wordmark. Replace with a proper SVG asset when
+// the walking skeleton graduates to a full integration.
+const OpencodeIcon = ({ className }: { className?: string }) => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+    <path d="M8 4H4v16h4" />
+    <path d="M16 4h4v16h-4" />
+    <path d="M10 12h4" />
+  </svg>
+)
+
 export type AgentProviderId = "claude-code" | "codex" | "opencode"
 
 type ClaudeModelOption = {
@@ -88,6 +99,7 @@ type FlatModelItem =
   | { type: "codex"; model: CodexModelOption }
   | { type: "ollama"; modelName: string; isRecommended: boolean }
   | { type: "custom" }
+  | { type: "opencode" }
 
 function CodexThinkingSubMenu({
   thinkings,
@@ -355,6 +367,11 @@ export function AgentModelSelector({
       items.push({ type: "codex", model: m })
     }
 
+    // opencode is always shown as a single entry — model selection is
+    // delegated to opencode itself via `opencode auth`, so there's no
+    // per-model dropdown on this side. Walking-skeleton scope.
+    items.push({ type: "opencode" })
+
     return items
   }, [claude, codex])
 
@@ -376,6 +393,8 @@ export function AgentModelSelector({
           return item.modelName.toLowerCase().includes(q)
         case "custom":
           return "custom model".includes(q)
+        case "opencode":
+          return "opencode".includes(q)
       }
     })
   }, [allModels, search])
@@ -391,9 +410,11 @@ export function AgentModelSelector({
   )
 
   const triggerIcon =
-    selectedAgentId === "claude-code" &&
-    claude.isOffline &&
-    claude.ollamaModels.length > 0 ? (
+    selectedAgentId === "opencode" ? (
+      <OpencodeIcon className="h-3.5 w-3.5" />
+    ) : selectedAgentId === "claude-code" &&
+      claude.isOffline &&
+      claude.ollamaModels.length > 0 ? (
       <Zap className="h-4 w-4" />
     ) : selectedAgentId === "codex" ? (
       <CodexIcon className="h-3.5 w-3.5" />
@@ -411,11 +432,15 @@ export function AgentModelSelector({
         return selectedAgentId === "claude-code" && claude.selectedOllamaModel === item.modelName
       case "custom":
         return selectedAgentId === "claude-code"
+      case "opencode":
+        return selectedAgentId === "opencode"
     }
   }
 
   const getItemProvider = (item: FlatModelItem): AgentProviderId => {
-    return item.type === "codex" ? "codex" : "claude-code"
+    if (item.type === "codex") return "codex"
+    if (item.type === "opencode") return "opencode"
+    return "claude-code"
   }
 
   const isItemDisabled = (item: FlatModelItem): boolean => {
@@ -489,6 +514,10 @@ export function AgentModelSelector({
         if (!canSelectProvider("claude-code")) return
         onSelectedAgentIdChange("claude-code")
         break
+      case "opencode":
+        if (!canSelectProvider("opencode")) return
+        onSelectedAgentIdChange("opencode")
+        break
     }
     handleOpenChange(false)
   }
@@ -503,6 +532,8 @@ export function AgentModelSelector({
         return <Zap className="h-4 w-4 text-muted-foreground shrink-0" />
       case "custom":
         return <ClaudeCodeIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+      case "opencode":
+        return <OpencodeIcon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
     }
   }
 
@@ -516,6 +547,8 @@ export function AgentModelSelector({
         return item.modelName + (item.isRecommended ? " (recommended)" : "")
       case "custom":
         return "Custom Model"
+      case "opencode":
+        return "opencode"
     }
   }
 
@@ -529,6 +562,8 @@ export function AgentModelSelector({
         return `ollama-${item.modelName}`
       case "custom":
         return "custom"
+      case "opencode":
+        return "opencode"
     }
   }
 
@@ -648,7 +683,13 @@ export function AgentModelSelector({
 
       <CrossProviderConfirmDialog
         isOpen={confirmDialogOpen}
-        providerName={pendingProvider === "codex" ? "Codex" : "Claude Code"}
+        providerName={
+          pendingProvider === "codex"
+            ? "Codex"
+            : pendingProvider === "opencode"
+              ? "opencode"
+              : "Claude Code"
+        }
         onConfirm={handleConfirmCrossProvider}
         onClose={handleCloseConfirmDialog}
       />
